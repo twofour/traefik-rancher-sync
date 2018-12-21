@@ -1,0 +1,147 @@
+#!/usr/local/bin/robo
+<?php
+
+use Robo\Tasks;
+
+class RoboFile extends Tasks {
+
+    protected $rancherUrl;
+
+    protected $rancherUserName;
+
+    protected $rancherPassword;
+
+    public function sync(string $rancherUrl, string $rancherUsername, string $rancherPassword) {
+        $this->rancherUrl = $rancherUrl;
+        $this->rancherUsername = $rancherUsername;
+        $this->rancherPassword = $rancherPassword;
+
+        $acmeFileName = '/mnt/acme.json';
+        if(!file_exists($acmeFileName)) {
+            printf("Acme file '%s' not found\n", $acmeFileName);
+            die(1);
+        }
+
+        printf("Process '%s'\n'", $acmeFileName);
+
+        $json = file_get_contents($acmeFileName);
+        $data = json_decode($json);
+
+        if(!isset($data->Certificates)) {
+            printf("No certificates found in '%s'\n", $acmeFileName);
+            die(1);
+        }
+
+        foreach($data->Certificates as $info) {
+            try {
+                $this->uploadCertificate($info);
+            }
+            catch(Throwable $e) {
+                var_dump($e->getMessage());
+            }
+        }
+    }
+
+    protected function uploadCertificate($info) {
+        $domainName = $this->formatDomainName($info->Domain->Main);
+
+        $data = json_encode([
+            'name' => $domainName,
+            'key' => $this->formatPrivateKey($info->Key),
+            'cert' => $this->formatCertificate($info->Certificate),
+            'certChain' => $this->formatCertificateChain($info->Certificate),
+        ], JSON_PRETTY_PRINT);
+
+        try {
+            $certificateId = $this->fetchCertificateIdByName($domainName);
+            $message = sprintf('Update certificate for %s', $domainName);
+            $this->say($message);
+            $this->updateCertificate($data, $certificateId);
+        }
+        catch(RuntimeException $e) {
+            $message = sprintf('Create certificate for %s', $domainName);
+            $this->say($message);
+            $this->createCertificate($data);
+        }
+    }
+
+    protected function createCurl() {
+        $curl = curl_init();
+        curl_setopt_array($curl, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_URL => $this->rancherUrl,
+            CURLOPT_USERNAME => $this->rancherUsername,
+            CURLOPT_PASSWORD => $this->rancherPassword,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json'
+            ]
+        ]);
+        return $curl;
+    }
+
+    protected function fetchCertificateIdByName(string $name): string {
+        $curl = $this->createCurl();
+        $response = curl_exec($curl);
+        $data = json_decode($response);
+        foreach($data->data as $info) {
+            if($info->name == $name) {
+                return $info->id;
+            }
+        }
+        throw new RuntimeException('Certificate not found');
+    }
+
+    protected function createCertificate(string $data): void {
+        $curl = $this->createCurl();
+        curl_setopt_array($curl, [
+            CURLOPT_POSTFIELDS => $data
+        ]);
+        curl_exec($curl);
+    }
+
+    protected function updateCertificate(string $data, string $certificateId): void {
+        $curl = $this->createCurl();
+        curl_setopt_array($curl, [
+            CURLOPT_URL => $this->rancherUrl.'/'.$certificateId,
+            CURLOPT_CUSTOMREQUEST => 'PUT',
+            CURLOPT_POSTFIELDS => $data
+        ]);
+        curl_exec($curl);
+    }
+
+    protected function formatDomainName(string $domainName): string {
+        $parts = explode('.', $domainName);
+        $parts = array_reverse($parts);
+        return implode('.', $parts);
+    }
+
+    protected function formatPrivateKey(string $data): string {
+        return base64_decode($data);
+    }
+
+    protected function splitCertificates(string $data): array {
+        $certificates = base64_decode($data);
+        $parts = explode("-----END CERTIFICATE-----\n\n", $certificates);
+        $parts = array_filter($parts, function(string $part) {
+            return strlen(trim($part)) > 0;
+        });
+        $parts = array_map(function(string $part) {
+            return $part . '-----END CERTIFICATE-----';
+        }, $parts);
+        return $parts;
+    }
+
+    protected function formatCertificate(string $data): string {
+        $certificates = $this->splitCertificates($data);
+        return $certificates[0];
+    }
+
+    protected function formatCertificateChain(string $data): string {
+        $certificates = $this->splitCertificates($data);
+        if(!array_key_exists(1, $certificates)) {
+            throw new RuntimeException('formatCertificateChain failed');
+        }
+        return $certificates[1];
+    }
+
+}
